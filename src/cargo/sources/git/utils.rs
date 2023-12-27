@@ -112,7 +112,7 @@ impl GitRemote {
         let locked_ref = locked_rev.map(|oid| GitReference::Rev(oid.to_string()));
         let reference = locked_ref.as_ref().unwrap_or(reference);
         if let Some(mut db) = db {
-            fetch(
+            let updated_rev = fetch(
                 &mut db.repo,
                 self.url.as_str(),
                 reference,
@@ -121,7 +121,7 @@ impl GitRemote {
             )
             .with_context(|| format!("failed to fetch into: {}", into.display()))?;
 
-            let resolved_commit_hash = match locked_rev {
+            let resolved_commit_hash = match updated_rev {
                 Some(rev) => db.contains(rev).then_some(rev),
                 None => resolve_ref(reference, &db.repo).ok(),
             };
@@ -929,7 +929,7 @@ pub fn fetch(
     reference: &GitReference,
     config: &Config,
     remote_kind: RemoteKind,
-) -> CargoResult<()> {
+) -> CargoResult<Option<Oid>> {
     if config.frozen() {
         anyhow::bail!(
             "attempting to update a git repository, but --frozen \
@@ -943,7 +943,7 @@ pub fn fetch(
     let shallow = remote_kind.to_shallow_setting(repo.is_shallow(), config);
 
     let oid_to_fetch = match github_fast_path(repo, remote_url, reference, config) {
-        Ok(FastPathRev::UpToDate) => return Ok(()),
+        Ok(FastPathRev::UpToDate) => return Ok(None),
         Ok(FastPathRev::NeedsFetch(rev)) => Some(rev),
         Ok(FastPathRev::Indeterminate) => None,
         Err(e) => {
@@ -1005,7 +1005,8 @@ pub fn fetch(
     }
 
     if let Some(true) = config.net_config()?.git_fetch_with_cli {
-        return fetch_with_cli(repo, remote_url, &refspecs, tags, config);
+        fetch_with_cli(repo, remote_url, &refspecs, tags, config)?;
+        return Ok(oid_to_fetch)
     }
 
     if config
@@ -1109,7 +1110,7 @@ pub fn fetch(
         if repo_reinitialized.load(Ordering::Relaxed) {
             *git2_repo = git2::Repository::open(git2_repo.path())?;
         }
-        res
+        res.map(|()|oid_to_fetch)
     } else {
         debug!("doing a fetch for {remote_url}");
         let git_config = git2::Config::open_default()?;
@@ -1155,7 +1156,8 @@ pub fn fetch(
                 return Err(err.into());
             }
             Ok(())
-        })
+        })?;
+        Ok(oid_to_fetch)
     }
 }
 
@@ -1434,7 +1436,9 @@ fn github_fast_path(
                         return Ok(FastPathRev::UpToDate);
                     }
                 }
-                rev
+                // rev might be a short hash but completed with 0s into a 20 bytes oid
+                // Github doesn't support those extra 0s in its commits API - trim them
+                rev.trim_end_matches('0')
             } else {
                 debug!("can't use github fast path with `rev = \"{}\"`", rev);
                 return Ok(FastPathRev::Indeterminate);
@@ -1493,6 +1497,7 @@ fn github_fast_path(
         Ok(FastPathRev::UpToDate)
     } else if response_code == 200 {
         let oid_to_fetch = str::from_utf8(&response_body)?.parse::<Oid>()?;
+        debug!("GitHub responded oid: {}", oid_to_fetch);
         Ok(FastPathRev::NeedsFetch(oid_to_fetch))
     } else {
         // Usually response_code == 404 if the repository does not exist, and
